@@ -2,6 +2,12 @@ from qdrant_client import QdrantClient
 import openai
 from server.core.config import config
 from langsmith import traceable, get_current_run_tree
+from server.agents.models import RAGResponse
+import instructor
+import numpy as np
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import Document, Prefetch, FusionQuery
+from server.agents.utils.prompt_management import get_prompt_from_config
 
 @traceable(
     name="generate_embeddings",
@@ -30,10 +36,22 @@ description="Retrieve embedding data from Qdrant for a given query and collectio
 run_type="retriever"
 )
 def retrieve_embedding_data(qd_client: QdrantClient, query, collection_name, k=5):
+    
+    querry_embeddings = create_embeddings(query)
+    
     response = qd_client.query_points(
         collection_name=collection_name,
-        query=create_embeddings(query),
-        limit=k
+        prefetch=[Prefetch(
+            query=querry_embeddings,
+            using="text-embedding-3-small",
+            limit=20),
+            Prefetch(
+                query=Document(text=query, model="qdrant/bm25"),
+                using="bm25",
+                limit=20)
+            ],
+        query=FusionQuery(fusion="rrf"),
+        limit=k,
     )
 
     retrieved_context_ids = []
@@ -68,25 +86,8 @@ def format_context(retrived_context):
 
 @traceable(name="construct_prompt", run_type="prompt")
 def build_prompt(preprocessed_context, question):
-    prompt = f"""
-You are a specialized Product Expert Assistant. Your goal is to answer customer questions accurately using ONLY the provided product information.
-
-### Instructions:
-1. **Source of Truth:** Answer strictly based on the provided "Available Products" section below. Do not use outside knowledge or make assumptions.
-2. **Handling Missing Info:** If the answer cannot be found in the provided products, politely state that you do not have that information. Do not make up features.
-3. **Tone:** Be helpful, professional, and concise.
-4. **Terminology:** Never refer to the text below as "context" or "data." Refer to it naturally as "our current inventory" or "available products."
-
-### Available Products:
-<inventory_data>
-{preprocessed_context}
-</inventory_data>
-
-### Customer Question:
-{question}
-
-### Answer:
-"""
+    template = get_prompt_from_config('/app/apps/api/src/server/agents/prompts/rag_system.yml', 'retrieval_generation')
+    prompt = template.render(preprocessed_context=preprocessed_context, question=question)
     return prompt
 
 @traceable(name="generate_llm_response",
@@ -94,31 +95,35 @@ description="Generate a response from the LLM using the prompt",
 run_type="llm",
 metadata={"ls_provider": "openai", "ls_model_name": "gpt-5-nano"}
 )
-def generate_llm_response(prompt, model="gpt-5-nano"):
-    response = openai.chat.completions.create(
+def generate_llm_response(prompt, model="gpt-4.1-mini"):
+    
+    client = instructor.from_openai(openai.OpenAI())
+    
+    response, raw_response = client.chat.completions.create_with_completion(
         model=model,
         messages=[
             {"role": "system", "content": prompt},
-        ]
+        ],
+        response_model=RAGResponse
     )
     
     current_run = get_current_run_tree()
     
     if current_run:
         current_run.metadata["usage_metadata"] = {
-            "input_tokens": response.usage.prompt_tokens,
-            "output_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
+            "input_tokens": raw_response.usage.prompt_tokens,
+            "output_tokens": raw_response.usage.completion_tokens,
+            "total_tokens": raw_response.usage.total_tokens,
             "model": model
         }
         
-    return response.choices[0].message.content
+    return response
 
 @traceable(
     name="integrated_rag_pipeline",
     description="Integrate the RAG pipeline for a given question",
 )
-def integrated_rag_pipeline(question, model="gpt-5-nano"):
+def integrated_rag_pipeline(question, model="gpt-4.1-mini", top_k=5):
     
     qdrant_client = QdrantClient(   
         url=config.qdrant_url,
@@ -127,8 +132,8 @@ def integrated_rag_pipeline(question, model="gpt-5-nano"):
     retrieved_context = retrieve_embedding_data(
         qdrant_client,
         question,
-        collection_name="amazon_items-collection-00",
-        k=5
+        collection_name="amazon_items-collection-hybrid-02",
+        k=top_k
     )
     # Step 2: Format context
     formatted_context = format_context(retrieved_context)   
@@ -139,10 +144,58 @@ def integrated_rag_pipeline(question, model="gpt-5-nano"):
     
     final_response = {
         "question": question,
-        "answer": response,
+        "answer": response.answer,
+        "references": response.references,
         "retrieved_context_ids": retrieved_context["context_ids"],
         "retrieved_context": retrieved_context["context"],
         "similarity_scores": retrieved_context["scores"],
     }
         
     return final_response
+
+def rag_pipeline_wrapper(question, top_k=5):
+    
+    qdrant_client = QdrantClient(   
+        url=config.qdrant_url,
+    )
+    
+    result = integrated_rag_pipeline(question, model="gpt-4.1-mini", top_k=top_k)
+    
+    used_context = []
+    
+    dummy_vector = np.zeros(1536).tolist()
+        
+    for item in result.get("references"):
+        payload = qdrant_client.query_points(
+            collection_name="amazon_items-collection-hybrid-02",
+            query=dummy_vector,
+            limit=1,
+            with_payload=True,
+            using="text-embedding-3-small",
+            with_vectors=False,
+            query_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="parent_asin",
+                        match=MatchValue(value=item.id)
+                    )
+                ]
+            )
+        )
+        if payload.points[0].payload["parent_asin"]:
+            image_url = payload.points[0].payload.get("image", None)
+            price = payload.points[0].payload.get("price", None)
+            if image_url:
+                used_context.append({
+                    "id": item.id,
+                    "description": item.description,
+                    "image_url": image_url,
+                    "price": price
+                })
+            
+    return {
+        "answer": result.get("answer", ""),
+        "used_context": used_context,
+    }
+    
+    
